@@ -27,7 +27,9 @@ internal static class NuggetTextToolProgram
             return args[0].ToLowerInvariant() switch
             {
                 "flatten" => RunFlatten(args),
+                "flatten-folder" => RunFlattenFolder(args),
                 "restore" => RunRestore(args),
+                "restore-folder" => RunRestoreFolder(args),
                 _ => ExitWithUsage($"Unknown command '{args[0]}'."),
             };
         }
@@ -49,17 +51,58 @@ internal static class NuggetTextToolProgram
         var outputPath = Path.GetFullPath(args[2]);
 
         EnsureReadableFile(inputPath);
-        EnsureDistinctPaths(inputPath, outputPath);
-        EnsureTargetDoesNotExist(outputPath);
-
-        using (var writer = new StreamWriter(outputPath, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
-        {
-            writer.NewLine = "\n";
-            WriteBase64Payload(inputPath, writer);
-        }
+        FlattenFile(inputPath, outputPath);
 
         Console.WriteLine($"Flattened '{inputPath}' to raw Base64 payload '{outputPath}'.");
         return 0;
+    }
+
+    private static int RunFlattenFolder(string[] args)
+    {
+        if (args.Length is < 2 or > 3)
+        {
+            return ExitWithUsage("flatten-folder requires <input-folder> and optional [output-subfolder-name].");
+        }
+
+        var inputFolderPath = Path.GetFullPath(args[1]);
+        EnsureReadableDirectory(inputFolderPath);
+
+        var outputFolderPath = ResolveOutputFolder(inputFolderPath, args.Length == 3 ? args[2] : "flattened");
+        Directory.CreateDirectory(outputFolderPath);
+
+        var inputFiles = Directory.EnumerateFiles(inputFolderPath, "*", SearchOption.TopDirectoryOnly)
+            .Where(path => !string.Equals(Path.GetExtension(path), ".txt", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (inputFiles.Length == 0)
+        {
+            throw new InvalidOperationException($"No files found to flatten in '{inputFolderPath}'.");
+        }
+
+        var successCount = 0;
+        var failureCount = 0;
+
+        foreach (var inputFile in inputFiles)
+        {
+            var outputFile = Path.Combine(outputFolderPath, $"{Path.GetFileName(inputFile)}.txt");
+
+            try
+            {
+                FlattenFile(inputFile, outputFile);
+                Console.WriteLine($"Flattened '{Path.GetFileName(inputFile)}' -> '{Path.GetFileName(outputFile)}'");
+                successCount++;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Failed to flatten '{inputFile}': {ex.Message}");
+                failureCount++;
+            }
+        }
+
+        Console.WriteLine(
+            $"Folder flatten complete. Output folder: '{outputFolderPath}'. Success: {successCount}. Failed: {failureCount}.");
+        return failureCount == 0 ? 0 : 1;
     }
 
     private static int RunRestore(string[] args)
@@ -73,53 +116,104 @@ internal static class NuggetTextToolProgram
         EnsureReadableFile(manifestPath);
         var outputPath = Path.GetFullPath(args[2]);
 
-        EnsureDistinctPaths(manifestPath, outputPath);
+        var result = RestoreFile(manifestPath, outputPath);
+
+        Console.WriteLine($"Restored '{outputPath}'.");
+        Console.WriteLine(
+            result.WasVerified
+                ? $"SHA-256 verified: {result.Sha256Hex}"
+                : $"Output SHA-256: {result.Sha256Hex}");
+        return 0;
+    }
+
+    private static int RunRestoreFolder(string[] args)
+    {
+        if (args.Length is < 2 or > 3)
+        {
+            return ExitWithUsage("restore-folder requires <input-folder> and optional [output-subfolder-name].");
+        }
+
+        var inputFolderPath = Path.GetFullPath(args[1]);
+        EnsureReadableDirectory(inputFolderPath);
+
+        var outputFolderPath = ResolveOutputFolder(inputFolderPath, args.Length == 3 ? args[2] : "restored");
+        Directory.CreateDirectory(outputFolderPath);
+
+        var inputFiles = Directory.EnumerateFiles(inputFolderPath, "*.txt", SearchOption.TopDirectoryOnly)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (inputFiles.Length == 0)
+        {
+            throw new InvalidOperationException($"No .txt payload files found in '{inputFolderPath}'.");
+        }
+
+        var successCount = 0;
+        var failureCount = 0;
+
+        foreach (var inputFile in inputFiles)
+        {
+            try
+            {
+                var outputFileName = GetRestoreOutputFileName(inputFile);
+                var outputFile = Path.Combine(outputFolderPath, outputFileName);
+                var result = RestoreFile(inputFile, outputFile);
+
+                Console.WriteLine(
+                    result.WasVerified
+                        ? $"Restored '{Path.GetFileName(inputFile)}' -> '{outputFileName}' (verified)"
+                        : $"Restored '{Path.GetFileName(inputFile)}' -> '{outputFileName}'");
+                successCount++;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Failed to restore '{inputFile}': {ex.Message}");
+                failureCount++;
+            }
+        }
+
+        Console.WriteLine(
+            $"Folder restore complete. Output folder: '{outputFolderPath}'. Success: {successCount}. Failed: {failureCount}.");
+        return failureCount == 0 ? 0 : 1;
+    }
+
+    private static void FlattenFile(string inputPath, string outputPath)
+    {
+        EnsureDistinctPaths(inputPath, outputPath);
+        EnsureTargetDoesNotExist(outputPath);
+
+        using var writer = new StreamWriter(outputPath, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        writer.NewLine = "\n";
+        WriteBase64Payload(inputPath, writer);
+    }
+
+    private static RestoreResult RestoreFile(string inputPath, string outputPath)
+    {
+        EnsureDistinctPaths(inputPath, outputPath);
         EnsureTargetDoesNotExist(outputPath);
 
         try
         {
-            using var reader = new StreamReader(manifestPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            var firstLine = reader.ReadLine();
-            if (firstLine is null)
-            {
-                throw new InvalidDataException("Input text file is empty.");
-            }
+            using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            var restoreInput = ReadRestoreInput(reader);
 
-            Manifest? manifest = null;
-            if (string.Equals(firstLine, ManifestMagic, StringComparison.Ordinal))
+            if (restoreInput.Manifest is not null)
             {
-                manifest = ReadManifest(reader);
                 DecodeBase64Payload(reader, outputPath);
             }
             else
             {
-                DecodeBase64Payload(reader, outputPath, firstLine);
+                DecodeBase64Payload(reader, outputPath, restoreInput.FirstPayloadLine);
             }
 
             var restoredDescription = DescribeFile(outputPath);
 
-            if (manifest is not null)
+            if (restoreInput.Manifest is not null)
             {
-                if (restoredDescription.Length != manifest.ExpectedLength)
-                {
-                    File.Delete(outputPath);
-                    throw new InvalidDataException(
-                        $"Length mismatch after restore. Expected {manifest.ExpectedLength}, got {restoredDescription.Length}.");
-                }
-
-                if (!string.Equals(restoredDescription.Sha256Hex, manifest.ExpectedSha256Hex, StringComparison.OrdinalIgnoreCase))
-                {
-                    File.Delete(outputPath);
-                    throw new InvalidDataException("SHA-256 mismatch after restore. The text file is incomplete or corrupted.");
-                }
+                VerifyRestoredFile(restoredDescription, restoreInput.Manifest);
             }
 
-            Console.WriteLine($"Restored '{outputPath}'.");
-            Console.WriteLine(
-                manifest is null
-                    ? $"Output SHA-256: {restoredDescription.Sha256Hex}"
-                    : $"SHA-256 verified: {restoredDescription.Sha256Hex}");
-            return 0;
+            return new RestoreResult(restoredDescription.Sha256Hex, restoreInput.Manifest is not null);
         }
         catch
         {
@@ -130,6 +224,75 @@ internal static class NuggetTextToolProgram
 
             throw;
         }
+    }
+
+    private static RestoreInput ReadRestoreInput(StreamReader reader)
+    {
+        var firstLine = reader.ReadLine();
+        if (firstLine is null)
+        {
+            throw new InvalidDataException("Input text file is empty.");
+        }
+
+        if (string.Equals(firstLine, ManifestMagic, StringComparison.Ordinal))
+        {
+            return new RestoreInput(ReadManifest(reader), null);
+        }
+
+        return new RestoreInput(null, firstLine);
+    }
+
+    private static void VerifyRestoredFile(FileDescription restoredDescription, Manifest manifest)
+    {
+        if (restoredDescription.Length != manifest.ExpectedLength)
+        {
+            throw new InvalidDataException(
+                $"Length mismatch after restore. Expected {manifest.ExpectedLength}, got {restoredDescription.Length}.");
+        }
+
+        if (!string.Equals(restoredDescription.Sha256Hex, manifest.ExpectedSha256Hex, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("SHA-256 mismatch after restore. The text file is incomplete or corrupted.");
+        }
+    }
+
+    private static string GetRestoreOutputFileName(string inputPath)
+    {
+        using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var restoreInput = ReadRestoreInput(reader);
+
+        if (!string.IsNullOrWhiteSpace(restoreInput.Manifest?.OriginalFileName))
+        {
+            return restoreInput.Manifest.OriginalFileName;
+        }
+
+        var inputFileName = Path.GetFileName(inputPath);
+        if (!inputFileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"Cannot infer restore file name from '{inputFileName}'.");
+        }
+
+        var outputFileName = inputFileName[..^4];
+        if (string.IsNullOrWhiteSpace(outputFileName))
+        {
+            throw new InvalidDataException($"Cannot infer restore file name from '{inputFileName}'.");
+        }
+
+        return outputFileName;
+    }
+
+    private static string ResolveOutputFolder(string inputFolderPath, string outputFolderOrSubfolder)
+    {
+        var outputFolderPath = Path.IsPathRooted(outputFolderOrSubfolder)
+            ? Path.GetFullPath(outputFolderOrSubfolder)
+            : Path.GetFullPath(Path.Combine(inputFolderPath, outputFolderOrSubfolder));
+
+        if (string.Equals(inputFolderPath, outputFolderPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("Input folder and output folder must be different.");
+        }
+
+        return outputFolderPath;
     }
 
     private static void WriteBase64Payload(string inputPath, StreamWriter writer)
@@ -186,6 +349,7 @@ internal static class NuggetTextToolProgram
 
     private static Manifest ReadManifest(StreamReader reader)
     {
+        string? encodedFileName = null;
         string? lengthValue = null;
         string? sha256Value = null;
         string? encodingValue = null;
@@ -215,6 +379,7 @@ internal static class NuggetTextToolProgram
             switch (key)
             {
                 case FileNameHeader:
+                    encodedFileName = value;
                     break;
                 case LengthHeader:
                     lengthValue = value;
@@ -249,7 +414,37 @@ internal static class NuggetTextToolProgram
 
         var expectedSha256Hex = NormalizeSha256(sha256Value);
 
-        return new Manifest(expectedLength, expectedSha256Hex);
+        return new Manifest(
+            string.IsNullOrWhiteSpace(encodedFileName) ? null : DecodeOriginalFileName(encodedFileName),
+            expectedLength,
+            expectedSha256Hex);
+    }
+
+    private static string DecodeOriginalFileName(string encodedFileName)
+    {
+        byte[] fileNameBytes;
+
+        try
+        {
+            fileNameBytes = Convert.FromBase64String(encodedFileName);
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidDataException("FileNameUtf8Base64 is not valid Base64.", ex);
+        }
+
+        var fileName = Encoding.UTF8.GetString(fileNameBytes);
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            throw new InvalidDataException("Original file name is empty.");
+        }
+
+        if (!string.Equals(fileName, Path.GetFileName(fileName), StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("Original file name contains path separators.");
+        }
+
+        return fileName;
     }
 
     private static string NormalizeSha256(string sha256Value)
@@ -320,6 +515,14 @@ internal static class NuggetTextToolProgram
         }
     }
 
+    private static void EnsureReadableDirectory(string path)
+    {
+        if (!Directory.Exists(path))
+        {
+            throw new DirectoryNotFoundException($"Directory not found: {path}");
+        }
+    }
+
     private static void EnsureTargetDoesNotExist(string path)
     {
         if (File.Exists(path))
@@ -357,14 +560,22 @@ internal static class NuggetTextToolProgram
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  dotnet run -- flatten <input-file> <output-text-file>");
+        Console.WriteLine("  dotnet run -- flatten-folder <input-folder> [output-subfolder-name]");
         Console.WriteLine("  dotnet run -- restore <input-text-file> <output-file>");
+        Console.WriteLine("  dotnet run -- restore-folder <input-folder> [output-subfolder-name]");
         Console.WriteLine();
         Console.WriteLine("Examples:");
         Console.WriteLine(@"  dotnet run -- flatten .\MyPackage.nupkg .\MyPackage.txt");
+        Console.WriteLine(@"  dotnet run -- flatten-folder .\nupkgs");
         Console.WriteLine(@"  dotnet run -- restore .\MyPackage.txt .\MyPackage-restored.nupkg");
+        Console.WriteLine(@"  dotnet run -- restore-folder .\nupkgs\flattened");
     }
 
     private sealed record FileDescription(long Length, string Sha256Hex);
 
-    private sealed record Manifest(long ExpectedLength, string ExpectedSha256Hex);
+    private sealed record Manifest(string? OriginalFileName, long ExpectedLength, string ExpectedSha256Hex);
+
+    private sealed record RestoreInput(Manifest? Manifest, string? FirstPayloadLine);
+
+    private sealed record RestoreResult(string Sha256Hex, bool WasVerified);
 }

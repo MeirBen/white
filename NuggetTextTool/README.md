@@ -14,7 +14,9 @@ If the goal is "text only, but no corruption", Base64 is the standard choice. It
 
 ```powershell
 dotnet run -- flatten .\MyPackage.nupkg .\MyPackage.txt
+dotnet run -- flatten-folder .\nupkgs
 dotnet run -- restore .\MyPackage.txt .\MyPackage-restored.nupkg
+dotnet run -- restore-folder .\nupkgs\flattened
 ```
 
 The generated text file is plain UTF-8 text containing only the Base64 payload.
@@ -22,3 +24,22 @@ The generated text file is plain UTF-8 text containing only the Base64 payload.
 If the payload is malformed, restore fails and deletes the partial output.
 
 Restore also accepts the older `NUGGETTXT/1` manifest format for backward compatibility, but new output is payload-only.
+
+## Folder mode
+
+`flatten-folder` creates a subfolder named `flattened` by default and writes one payload file per source file using this naming rule:
+
+```text
+original-file-name.ext -> original-file-name.ext.txt
+```
+
+That preserves the original name for `restore-folder`, which creates a `restored` subfolder by default and strips the final `.txt`.
+
+Examples:
+
+```powershell
+dotnet run -- flatten-folder .\nupkgs
+dotnet run -- flatten-folder .\nupkgs payloads
+dotnet run -- restore-folder .\nupkgs\flattened
+dotnet run -- restore-folder .\nupkgs\flattened rebuilt
+```

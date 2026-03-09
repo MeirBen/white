@@ -1,0 +1,14 @@
+# Build outputs
+**/bin/
+**/obj/
+
+# IDE files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# VS Code workspace files
+.vscode/*
+!.vscode/settings.json
