@@ -14,4 +14,4 @@
 !.vscode/settings.json
 
 # NuGet packages
-**/packages/
+**/nupkgs/
