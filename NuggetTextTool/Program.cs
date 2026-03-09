@@ -7,6 +7,7 @@ return NuggetTextToolProgram.Run(args);
 
 internal static class NuggetTextToolProgram
 {
+    private const string Sha256SidecarExtension = ".sha256";
     private const string ManifestMagic = "NUGGETTXT/1";
     private const string Base64EncodingName = "base64";
     private const string FileNameHeader = "FileNameUtf8Base64";
@@ -51,9 +52,11 @@ internal static class NuggetTextToolProgram
         var outputPath = Path.GetFullPath(args[2]);
 
         EnsureReadableFile(inputPath);
-        FlattenFile(inputPath, outputPath);
+        var description = FlattenFile(inputPath, outputPath);
 
-        Console.WriteLine($"Flattened '{inputPath}' to raw Base64 payload '{outputPath}'.");
+        Console.WriteLine(
+            $"Flattened '{inputPath}' to raw Base64 payload '{outputPath}' and hash sidecar '{GetSha256SidecarPath(outputPath)}'.");
+        Console.WriteLine($"SHA-256: {description.Sha256Hex}");
         return 0;
     }
 
@@ -71,7 +74,12 @@ internal static class NuggetTextToolProgram
         Directory.CreateDirectory(outputFolderPath);
 
         var inputFiles = Directory.EnumerateFiles(inputFolderPath, "*", SearchOption.TopDirectoryOnly)
-            .Where(path => !string.Equals(Path.GetExtension(path), ".txt", StringComparison.OrdinalIgnoreCase))
+            .Where(path =>
+            {
+                var extension = Path.GetExtension(path);
+                return !string.Equals(extension, ".txt", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(extension, Sha256SidecarExtension, StringComparison.OrdinalIgnoreCase);
+            })
             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
@@ -90,7 +98,8 @@ internal static class NuggetTextToolProgram
             try
             {
                 FlattenFile(inputFile, outputFile);
-                Console.WriteLine($"Flattened '{Path.GetFileName(inputFile)}' -> '{Path.GetFileName(outputFile)}'");
+                Console.WriteLine(
+                    $"Flattened '{Path.GetFileName(inputFile)}' -> '{Path.GetFileName(outputFile)}' + '{Path.GetFileName(GetSha256SidecarPath(outputFile))}'");
                 successCount++;
             }
             catch (Exception ex)
@@ -119,10 +128,7 @@ internal static class NuggetTextToolProgram
         var result = RestoreFile(manifestPath, outputPath);
 
         Console.WriteLine($"Restored '{outputPath}'.");
-        Console.WriteLine(
-            result.WasVerified
-                ? $"SHA-256 verified: {result.Sha256Hex}"
-                : $"Output SHA-256: {result.Sha256Hex}");
+        Console.WriteLine($"SHA-256 verified: {result.Sha256Hex}");
         return 0;
     }
 
@@ -157,12 +163,9 @@ internal static class NuggetTextToolProgram
             {
                 var outputFileName = GetRestoreOutputFileName(inputFile);
                 var outputFile = Path.Combine(outputFolderPath, outputFileName);
-                var result = RestoreFile(inputFile, outputFile);
+                RestoreFile(inputFile, outputFile);
 
-                Console.WriteLine(
-                    result.WasVerified
-                        ? $"Restored '{Path.GetFileName(inputFile)}' -> '{outputFileName}' (verified)"
-                        : $"Restored '{Path.GetFileName(inputFile)}' -> '{outputFileName}'");
+                Console.WriteLine($"Restored '{Path.GetFileName(inputFile)}' -> '{outputFileName}' (verified)");
                 successCount++;
             }
             catch (Exception ex)
@@ -177,14 +180,32 @@ internal static class NuggetTextToolProgram
         return failureCount == 0 ? 0 : 1;
     }
 
-    private static void FlattenFile(string inputPath, string outputPath)
+    private static FileDescription FlattenFile(string inputPath, string outputPath)
     {
         EnsureDistinctPaths(inputPath, outputPath);
         EnsureTargetDoesNotExist(outputPath);
+        var sidecarPath = GetSha256SidecarPath(outputPath);
+        EnsureTargetDoesNotExist(sidecarPath);
 
-        using var writer = new StreamWriter(outputPath, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-        writer.NewLine = "\n";
-        WriteBase64Payload(inputPath, writer);
+        var description = DescribeFile(inputPath);
+
+        try
+        {
+            using (var writer = new StreamWriter(outputPath, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+            {
+                writer.NewLine = "\n";
+                WriteBase64Payload(inputPath, writer);
+            }
+
+            WriteSha256Sidecar(sidecarPath, description.Sha256Hex);
+            return description;
+        }
+        catch
+        {
+            DeleteIfExists(outputPath);
+            DeleteIfExists(sidecarPath);
+            throw;
+        }
     }
 
     private static RestoreResult RestoreFile(string inputPath, string outputPath)
@@ -195,7 +216,7 @@ internal static class NuggetTextToolProgram
         try
         {
             using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            var restoreInput = ReadRestoreInput(reader);
+            var restoreInput = ReadRestoreInput(reader, inputPath);
 
             if (restoreInput.Manifest is not null)
             {
@@ -208,25 +229,18 @@ internal static class NuggetTextToolProgram
 
             var restoredDescription = DescribeFile(outputPath);
 
-            if (restoreInput.Manifest is not null)
-            {
-                VerifyRestoredFile(restoredDescription, restoreInput.Manifest);
-            }
+            VerifyRestoredFile(restoredDescription, restoreInput);
 
-            return new RestoreResult(restoredDescription.Sha256Hex, restoreInput.Manifest is not null);
+            return new RestoreResult(restoredDescription.Sha256Hex);
         }
         catch
         {
-            if (File.Exists(outputPath))
-            {
-                File.Delete(outputPath);
-            }
-
+            DeleteIfExists(outputPath);
             throw;
         }
     }
 
-    private static RestoreInput ReadRestoreInput(StreamReader reader)
+    private static RestoreInput ReadRestoreInput(StreamReader reader, string inputPath)
     {
         var firstLine = reader.ReadLine();
         if (firstLine is null)
@@ -236,21 +250,22 @@ internal static class NuggetTextToolProgram
 
         if (string.Equals(firstLine, ManifestMagic, StringComparison.Ordinal))
         {
-            return new RestoreInput(ReadManifest(reader), null);
+            var manifest = ReadManifest(reader);
+            return new RestoreInput(manifest, null, manifest.ExpectedLength, manifest.ExpectedSha256Hex);
         }
 
-        return new RestoreInput(null, firstLine);
+        return new RestoreInput(null, firstLine, null, ReadSha256Sidecar(inputPath));
     }
 
-    private static void VerifyRestoredFile(FileDescription restoredDescription, Manifest manifest)
+    private static void VerifyRestoredFile(FileDescription restoredDescription, RestoreInput restoreInput)
     {
-        if (restoredDescription.Length != manifest.ExpectedLength)
+        if (restoreInput.ExpectedLength is not null && restoredDescription.Length != restoreInput.ExpectedLength.Value)
         {
             throw new InvalidDataException(
-                $"Length mismatch after restore. Expected {manifest.ExpectedLength}, got {restoredDescription.Length}.");
+                $"Length mismatch after restore. Expected {restoreInput.ExpectedLength.Value}, got {restoredDescription.Length}.");
         }
 
-        if (!string.Equals(restoredDescription.Sha256Hex, manifest.ExpectedSha256Hex, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(restoredDescription.Sha256Hex, restoreInput.ExpectedSha256Hex, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidDataException("SHA-256 mismatch after restore. The text file is incomplete or corrupted.");
         }
@@ -259,7 +274,7 @@ internal static class NuggetTextToolProgram
     private static string GetRestoreOutputFileName(string inputPath)
     {
         using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        var restoreInput = ReadRestoreInput(reader);
+        var restoreInput = ReadRestoreInput(reader, inputPath);
 
         if (!string.IsNullOrWhiteSpace(restoreInput.Manifest?.OriginalFileName))
         {
@@ -279,6 +294,27 @@ internal static class NuggetTextToolProgram
         }
 
         return outputFileName;
+    }
+
+    private static string GetSha256SidecarPath(string payloadPath) => $"{payloadPath}{Sha256SidecarExtension}";
+
+    private static void WriteSha256Sidecar(string sidecarPath, string sha256Hex)
+    {
+        File.WriteAllText(sidecarPath, $"{sha256Hex}\n", new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+
+    private static string ReadSha256Sidecar(string payloadPath)
+    {
+        var sidecarPath = GetSha256SidecarPath(payloadPath);
+        EnsureReadableFile(sidecarPath);
+
+        var sidecarContent = File.ReadAllText(sidecarPath, Encoding.UTF8).Trim();
+        if (string.IsNullOrWhiteSpace(sidecarContent))
+        {
+            throw new InvalidDataException($"SHA-256 sidecar is empty: {sidecarPath}");
+        }
+
+        return NormalizeSha256(sidecarContent);
     }
 
     private static string ResolveOutputFolder(string inputFolderPath, string outputFolderOrSubfolder)
@@ -523,6 +559,14 @@ internal static class NuggetTextToolProgram
         }
     }
 
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
+    }
+
     private static void EnsureTargetDoesNotExist(string path)
     {
         if (File.Exists(path))
@@ -569,13 +613,19 @@ internal static class NuggetTextToolProgram
         Console.WriteLine(@"  dotnet run -- flatten-folder .\nupkgs");
         Console.WriteLine(@"  dotnet run -- restore .\MyPackage.txt .\MyPackage-restored.nupkg");
         Console.WriteLine(@"  dotnet run -- restore-folder .\nupkgs\flattened");
+        Console.WriteLine();
+        Console.WriteLine("Each payload file is paired with a sibling .sha256 file and restore verifies it automatically.");
     }
 
     private sealed record FileDescription(long Length, string Sha256Hex);
 
     private sealed record Manifest(string? OriginalFileName, long ExpectedLength, string ExpectedSha256Hex);
 
-    private sealed record RestoreInput(Manifest? Manifest, string? FirstPayloadLine);
+    private sealed record RestoreInput(
+        Manifest? Manifest,
+        string? FirstPayloadLine,
+        long? ExpectedLength,
+        string ExpectedSha256Hex);
 
-    private sealed record RestoreResult(string Sha256Hex, bool WasVerified);
+    private sealed record RestoreResult(string Sha256Hex);
 }

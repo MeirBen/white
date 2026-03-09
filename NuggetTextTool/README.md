@@ -4,7 +4,8 @@
 
 It uses:
 
-- Base64 for the text payload only
+- Base64 for the text payload
+- SHA-256 sidecar verification
 
 ## Why this approach
 
@@ -20,17 +21,22 @@ dotnet run -- restore-folder .\nupkgs\flattened
 ```
 
 The generated text file is plain UTF-8 text containing only the Base64 payload.
+Each payload file also gets a sibling SHA-256 file:
 
-If the payload is malformed, restore fails and deletes the partial output.
+```text
+MyPackage.txt
+MyPackage.txt.sha256
+```
 
-Restore also accepts the older `NUGGETTXT/1` manifest format for backward compatibility, but new output is payload-only.
+If the payload is malformed, the `.sha256` file is missing, or the restored bytes do not match the stored SHA-256 hash, restore fails and deletes the partial output.
 
 ## Folder mode
 
-`flatten-folder` creates a subfolder named `flattened` by default and writes one payload file per source file using this naming rule:
+`flatten-folder` creates a subfolder named `flattened` by default and writes one payload pair per source file using these naming rules:
 
 ```text
 original-file-name.ext -> original-file-name.ext.txt
+original-file-name.ext -> original-file-name.ext.txt.sha256
 ```
 
 That preserves the original name for `restore-folder`, which creates a `restored` subfolder by default and strips the final `.txt`.
