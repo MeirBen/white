@@ -11,6 +11,13 @@ It uses:
 
 If the goal is "text only, but no corruption", Base64 is the standard choice. It increases file size by about 33%, but it is deterministic and reversible.
 
+Restore accepts only the current format:
+
+```text
+line 1: SHA-256
+line 2+: Base64 payload
+```
+
 ## Commands
 
 ```powershell

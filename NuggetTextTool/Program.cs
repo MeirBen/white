@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -7,13 +6,6 @@ return NuggetTextToolProgram.Run(args);
 
 internal static class NuggetTextToolProgram
 {
-    private const string ManifestMagic = "NUGGETTXT/1";
-    private const string Base64EncodingName = "base64";
-    private const string FileNameHeader = "FileNameUtf8Base64";
-    private const string LengthHeader = "Length";
-    private const string HashHeader = "Sha256";
-    private const string EncodingHeader = "Encoding";
-
     public static int Run(string[] args)
     {
         if (args.Length == 0 || IsHelp(args[0]))
@@ -210,20 +202,11 @@ internal static class NuggetTextToolProgram
         try
         {
             using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            var restoreInput = ReadRestoreInput(reader, inputPath);
-
-            if (restoreInput.Manifest is not null)
-            {
-                DecodeBase64Payload(reader, outputPath);
-            }
-            else
-            {
-                DecodeBase64Payload(reader, outputPath, restoreInput.FirstPayloadLine);
-            }
+            var expectedSha256Hex = ReadEmbeddedSha256(reader);
+            DecodeBase64Payload(reader, outputPath);
 
             var restoredDescription = DescribeFile(outputPath);
-
-            VerifyRestoredFile(restoredDescription, restoreInput);
+            VerifyRestoredFile(restoredDescription, expectedSha256Hex);
 
             return new RestoreResult(restoredDescription.Sha256Hex);
         }
@@ -234,7 +217,7 @@ internal static class NuggetTextToolProgram
         }
     }
 
-    private static RestoreInput ReadRestoreInput(StreamReader reader, string inputPath)
+    private static string ReadEmbeddedSha256(StreamReader reader)
     {
         var firstLine = reader.ReadLine();
         if (firstLine is null)
@@ -242,29 +225,17 @@ internal static class NuggetTextToolProgram
             throw new InvalidDataException("Input text file is empty.");
         }
 
-        if (string.Equals(firstLine, ManifestMagic, StringComparison.Ordinal))
-        {
-            var manifest = ReadManifest(reader);
-            return new RestoreInput(manifest, null, manifest.ExpectedLength, manifest.ExpectedSha256Hex);
-        }
-
         if (TryNormalizeSha256(firstLine, out var embeddedSha256))
         {
-            return new RestoreInput(null, reader.ReadLine(), null, embeddedSha256);
+            return embeddedSha256;
         }
 
-        return new RestoreInput(null, firstLine, null, ReadSha256Sidecar(inputPath));
+        throw new InvalidDataException("Line 1 must contain a 64-character SHA-256 hash.");
     }
 
-    private static void VerifyRestoredFile(FileDescription restoredDescription, RestoreInput restoreInput)
+    private static void VerifyRestoredFile(FileDescription restoredDescription, string expectedSha256Hex)
     {
-        if (restoreInput.ExpectedLength is not null && restoredDescription.Length != restoreInput.ExpectedLength.Value)
-        {
-            throw new InvalidDataException(
-                $"Length mismatch after restore. Expected {restoreInput.ExpectedLength.Value}, got {restoredDescription.Length}.");
-        }
-
-        if (!string.Equals(restoredDescription.Sha256Hex, restoreInput.ExpectedSha256Hex, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(restoredDescription.Sha256Hex, expectedSha256Hex, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidDataException("SHA-256 mismatch after restore. The text file is incomplete or corrupted.");
         }
@@ -272,14 +243,6 @@ internal static class NuggetTextToolProgram
 
     private static string GetRestoreOutputFileName(string inputPath)
     {
-        using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        var restoreInput = ReadRestoreInput(reader, inputPath);
-
-        if (!string.IsNullOrWhiteSpace(restoreInput.Manifest?.OriginalFileName))
-        {
-            return restoreInput.Manifest.OriginalFileName;
-        }
-
         var inputFileName = Path.GetFileName(inputPath);
         if (!inputFileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
         {
@@ -293,20 +256,6 @@ internal static class NuggetTextToolProgram
         }
 
         return outputFileName;
-    }
-
-    private static string ReadSha256Sidecar(string payloadPath)
-    {
-        var sidecarPath = $"{payloadPath}.sha256";
-        EnsureReadableFile(sidecarPath);
-
-        var sidecarContent = File.ReadAllText(sidecarPath, Encoding.UTF8).Trim();
-        if (string.IsNullOrWhiteSpace(sidecarContent))
-        {
-            throw new InvalidDataException($"SHA-256 sidecar is empty: {sidecarPath}");
-        }
-
-        return NormalizeSha256(sidecarContent);
     }
 
     private static string ResolveOutputFolder(string inputFolderPath, string outputFolderOrSubfolder)
@@ -375,116 +324,6 @@ internal static class NuggetTextToolProgram
         }
     }
 
-    private static Manifest ReadManifest(StreamReader reader)
-    {
-        string? encodedFileName = null;
-        string? lengthValue = null;
-        string? sha256Value = null;
-        string? encodingValue = null;
-
-        while (true)
-        {
-            var line = reader.ReadLine();
-            if (line is null)
-            {
-                throw new InvalidDataException("Manifest ended before the Base64 payload started.");
-            }
-
-            if (line.Length == 0)
-            {
-                break;
-            }
-
-            var separatorIndex = line.IndexOf(':');
-            if (separatorIndex <= 0)
-            {
-                throw new InvalidDataException($"Invalid manifest line '{line}'.");
-            }
-
-            var key = line[..separatorIndex];
-            var value = line[(separatorIndex + 1)..];
-
-            switch (key)
-            {
-                case FileNameHeader:
-                    encodedFileName = value;
-                    break;
-                case LengthHeader:
-                    lengthValue = value;
-                    break;
-                case HashHeader:
-                    sha256Value = value;
-                    break;
-                case EncodingHeader:
-                    encodingValue = value;
-                    break;
-                default:
-                    throw new InvalidDataException($"Unknown manifest key '{key}'.");
-            }
-        }
-
-        if (string.IsNullOrWhiteSpace(lengthValue) ||
-            string.IsNullOrWhiteSpace(sha256Value) ||
-            string.IsNullOrWhiteSpace(encodingValue))
-        {
-            throw new InvalidDataException("Manifest is missing one or more required metadata fields.");
-        }
-
-        if (!string.Equals(encodingValue, Base64EncodingName, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidDataException($"Unsupported payload encoding '{encodingValue}'.");
-        }
-
-        if (!long.TryParse(lengthValue, NumberStyles.None, CultureInfo.InvariantCulture, out var expectedLength) || expectedLength < 0)
-        {
-            throw new InvalidDataException($"Invalid file length '{lengthValue}'.");
-        }
-
-        var expectedSha256Hex = NormalizeSha256(sha256Value);
-
-        return new Manifest(
-            string.IsNullOrWhiteSpace(encodedFileName) ? null : DecodeOriginalFileName(encodedFileName),
-            expectedLength,
-            expectedSha256Hex);
-    }
-
-    private static string DecodeOriginalFileName(string encodedFileName)
-    {
-        byte[] fileNameBytes;
-
-        try
-        {
-            fileNameBytes = Convert.FromBase64String(encodedFileName);
-        }
-        catch (FormatException ex)
-        {
-            throw new InvalidDataException("FileNameUtf8Base64 is not valid Base64.", ex);
-        }
-
-        var fileName = Encoding.UTF8.GetString(fileNameBytes);
-        if (string.IsNullOrWhiteSpace(fileName))
-        {
-            throw new InvalidDataException("Original file name is empty.");
-        }
-
-        if (!string.Equals(fileName, Path.GetFileName(fileName), StringComparison.Ordinal))
-        {
-            throw new InvalidDataException("Original file name contains path separators.");
-        }
-
-        return fileName;
-    }
-
-    private static string NormalizeSha256(string sha256Value)
-    {
-        if (!TryNormalizeSha256(sha256Value, out var normalized))
-        {
-            throw new InvalidDataException("SHA-256 must be a 64-character hexadecimal string.");
-        }
-
-        return normalized;
-    }
-
     private static bool TryNormalizeSha256(string? sha256Value, out string normalized)
     {
         normalized = string.Empty;
@@ -505,7 +344,7 @@ internal static class NuggetTextToolProgram
         return true;
     }
 
-    private static void DecodeBase64Payload(StreamReader reader, string outputPath, string? firstPayloadLine = null)
+    private static void DecodeBase64Payload(StreamReader reader, string outputPath)
     {
         using var output = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         using var transform = new FromBase64Transform(FromBase64TransformMode.IgnoreWhiteSpaces);
@@ -513,11 +352,6 @@ internal static class NuggetTextToolProgram
 
         try
         {
-            if (firstPayloadLine is not null)
-            {
-                WriteBase64Line(decoder, firstPayloadLine);
-            }
-
             string? line;
             while ((line = reader.ReadLine()) is not null)
             {
@@ -622,14 +456,6 @@ internal static class NuggetTextToolProgram
     }
 
     private sealed record FileDescription(long Length, string Sha256Hex);
-
-    private sealed record Manifest(string? OriginalFileName, long ExpectedLength, string ExpectedSha256Hex);
-
-    private sealed record RestoreInput(
-        Manifest? Manifest,
-        string? FirstPayloadLine,
-        long? ExpectedLength,
-        string ExpectedSha256Hex);
 
     private sealed record RestoreResult(string Sha256Hex);
 }
