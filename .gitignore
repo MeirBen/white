@@ -12,3 +12,6 @@
 # VS Code workspace files
 .vscode/*
 !.vscode/settings.json
+
+# NuGet packages
+**/packages/

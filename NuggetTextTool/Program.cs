@@ -347,30 +347,38 @@ internal static class NuggetTextToolProgram
     private static void DecodeBase64Payload(StreamReader reader, string outputPath)
     {
         using var output = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-        using var transform = new FromBase64Transform(FromBase64TransformMode.IgnoreWhiteSpaces);
-        using var decoder = new CryptoStream(output, transform, CryptoStreamMode.Write);
 
         try
         {
             string? line;
             while ((line = reader.ReadLine()) is not null)
             {
-                WriteBase64Line(decoder, line);
-            }
+                if (line.Length == 0)
+                {
+                    continue;
+                }
 
-            decoder.FlushFinalBlock();
+                byte[] decodedBytes;
+                try
+                {
+                    decodedBytes = Convert.FromBase64String(line);
+                }
+                catch (FormatException ex)
+                {
+                    throw new InvalidDataException("The payload is not valid Base64.", ex);
+                }
+
+                output.Write(decodedBytes, 0, decodedBytes.Length);
+            }
+        }
+        catch (InvalidDataException)
+        {
+            throw;
         }
         catch (Exception ex) when (ex is CryptographicException or FormatException)
         {
             throw new InvalidDataException("The payload is not valid Base64.", ex);
         }
-    }
-
-    private static void WriteBase64Line(CryptoStream decoder, string line)
-    {
-        var encodedBytes = Encoding.ASCII.GetBytes(line);
-        decoder.Write(encodedBytes, 0, encodedBytes.Length);
-        decoder.WriteByte((byte)'\n');
     }
 
     private static FileDescription DescribeFile(string path)
