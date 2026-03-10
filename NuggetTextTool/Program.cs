@@ -6,6 +6,8 @@ return NuggetTextToolProgram.Run(args);
 
 internal static class NuggetTextToolProgram
 {
+    private const string FileNamePrefix = "NAME:";
+
     public static int Run(string[] args)
     {
         if (args.Length == 0 || IsHelp(args[0]))
@@ -83,7 +85,7 @@ internal static class NuggetTextToolProgram
 
         foreach (var inputFile in inputFiles)
         {
-            var outputFile = Path.Combine(outputFolderPath, $"{Path.GetFileName(inputFile)}.txt");
+            var outputFile = Path.Combine(outputFolderPath, GetHashedPayloadFileName(inputFile));
 
             try
             {
@@ -175,6 +177,7 @@ internal static class NuggetTextToolProgram
         EnsureTargetDoesNotExist(outputPath);
 
         var description = DescribeFile(inputPath);
+        var originalFileName = Path.GetFileName(inputPath);
 
         try
         {
@@ -182,6 +185,7 @@ internal static class NuggetTextToolProgram
             {
                 writer.NewLine = "\n";
                 writer.WriteLine(description.Sha256Hex);
+                writer.WriteLine($"{FileNamePrefix}{originalFileName}");
                 WriteBase64Payload(inputPath, writer);
             }
 
@@ -203,6 +207,7 @@ internal static class NuggetTextToolProgram
         {
             using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
             var expectedSha256Hex = ReadEmbeddedSha256(reader);
+            ReadEmbeddedOriginalFileName(reader);
             DecodeBase64Payload(reader, outputPath);
 
             var restoredDescription = DescribeFile(outputPath);
@@ -233,6 +238,33 @@ internal static class NuggetTextToolProgram
         throw new InvalidDataException("Line 1 must contain a 64-character SHA-256 hash.");
     }
 
+    private static string ReadEmbeddedOriginalFileName(StreamReader reader)
+    {
+        var secondLine = reader.ReadLine();
+        if (string.IsNullOrWhiteSpace(secondLine))
+        {
+            throw new InvalidDataException("Line 2 must contain the original file name.");
+        }
+
+        if (!secondLine.StartsWith(FileNamePrefix, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException($"Line 2 must start with '{FileNamePrefix}'.");
+        }
+
+        var originalFileName = secondLine[FileNamePrefix.Length..];
+        if (string.IsNullOrWhiteSpace(originalFileName))
+        {
+            throw new InvalidDataException("Original file name is empty.");
+        }
+
+        if (!string.Equals(originalFileName, Path.GetFileName(originalFileName), StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("Original file name contains path separators.");
+        }
+
+        return originalFileName;
+    }
+
     private static void VerifyRestoredFile(FileDescription restoredDescription, string expectedSha256Hex)
     {
         if (!string.Equals(restoredDescription.Sha256Hex, expectedSha256Hex, StringComparison.OrdinalIgnoreCase))
@@ -243,19 +275,16 @@ internal static class NuggetTextToolProgram
 
     private static string GetRestoreOutputFileName(string inputPath)
     {
-        var inputFileName = Path.GetFileName(inputPath);
-        if (!inputFileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidDataException($"Cannot infer restore file name from '{inputFileName}'.");
-        }
+        using var reader = new StreamReader(inputPath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        _ = ReadEmbeddedSha256(reader);
+        return ReadEmbeddedOriginalFileName(reader);
+    }
 
-        var outputFileName = inputFileName[..^4];
-        if (string.IsNullOrWhiteSpace(outputFileName))
-        {
-            throw new InvalidDataException($"Cannot infer restore file name from '{inputFileName}'.");
-        }
-
-        return outputFileName;
+    private static string GetHashedPayloadFileName(string inputPath)
+    {
+        var originalFileName = Path.GetFileName(inputPath);
+        var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(originalFileName));
+        return $"{Convert.ToHexString(hashBytes)}.txt";
     }
 
     private static string ResolveOutputFolder(string inputFolderPath, string outputFolderOrSubfolder)
@@ -460,7 +489,8 @@ internal static class NuggetTextToolProgram
         Console.WriteLine(@"  dotnet run -- restore .\MyPackage.txt .\MyPackage-restored.nupkg");
         Console.WriteLine(@"  dotnet run -- restore-folder .\nupkgs\flattened");
         Console.WriteLine();
-        Console.WriteLine("Each payload file stores the SHA-256 on line 1 and the Base64 payload on the lines below.");
+        Console.WriteLine("Each payload file stores SHA-256 on line 1, original file name on line 2, and Base64 payload below.");
+        Console.WriteLine("Folder flatten writes hashed .txt file names and folder restore uses the embedded original file name.");
     }
 
     private sealed record FileDescription(long Length, string Sha256Hex);
